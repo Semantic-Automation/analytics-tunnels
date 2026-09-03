@@ -48,9 +48,20 @@ class TunnelRegistry:
             await tunnel.close()
 
     async def _register_tunnel(self, tunnel_id: str, tunnel: Tunnel) -> None:
-        """Store a tunnel, closing any displaced connection for the same id."""
+        """Store a tunnel, closing any displaced connection for the same id.
+
+        A second connection registering with the same ``tunnel_id`` displaces
+        (closes) the first. That is intentional (a tunnel_id is unique to one
+        entity) but it is almost always a bug or a duplicate client, so we log
+        it loudly instead of silently killing a live connection.
+        """
         async with self._lock:
             old = self._tunnels.pop(tunnel_id, None)
             self._tunnels[tunnel_id] = tunnel
         if old is not None and old is not tunnel:
+            print(
+                f"[tunnelkit] DISPLACED {tunnel_id}: new {type(tunnel).__name__} "
+                f"replaced existing {type(old).__name__}; closing the old connection",
+                flush=True,
+            )
             await old.close()
