@@ -36,6 +36,12 @@ class TunnelClient:
     *reconnect* (never the initial connection), right before the backoff
     sleep.  It lets a caller re-fetch configuration (e.g. a signed manifest)
     whenever the tunnel comes back up after a drop.
+
+    ``on_manifest_update`` is an optional zero-arg callback invoked when the
+    proxy sends a ``{type: "manifest_update"}`` signal over the tunnel
+    (broadcast when the proxy receives a fresh signed manifest from the hub).
+    The caller typically re-fetches the manifest so newly-enrolled spokes
+    appear without a reconnect.
     """
 
     def __init__(
@@ -46,6 +52,7 @@ class TunnelClient:
         handler=None,
         health_fn=None,
         on_reconnect=None,
+        on_manifest_update=None,
     ):
         self._proxy_url = proxy_url.rstrip("/")
         self._tunnel_id = tunnel_id
@@ -53,6 +60,7 @@ class TunnelClient:
         self._handler = handler
         self._health_fn = health_fn
         self._on_reconnect = on_reconnect
+        self._on_manifest_update = on_manifest_update
         self._connected_once = False
         self._ws = None
         self._running = False
@@ -112,22 +120,7 @@ class TunnelClient:
                 if isinstance(data, bytes):
                     data = data.decode("utf-8")
                 msg = json.loads(data)
-                msg_type = msg.get("type", "")
-
-                if msg_type == "request":
-                    # Handle in a background thread so the listen loop keeps
-                    # calling recv()/ping() during long processing (the
-                    # transport drops idle sockets).
-                    threading.Thread(
-                        target=self._handle_request,
-                        args=(msg,),
-                        daemon=True,
-                    ).start()
-                elif msg_type == "ping":
-                    try:
-                        self._ws.send(json.dumps({"type": "pong"}))
-                    except Exception:  # noqa: BLE001
-                        pass
+                self._dispatch(msg)
 
             except websocket.WebSocketTimeoutException:
                 try:
@@ -142,6 +135,31 @@ class TunnelClient:
             except Exception as e:  # noqa: BLE001
                 print(f"[tunnel] receive error: {e}", flush=True)
                 break
+
+    def _dispatch(self, msg: dict) -> None:
+        """Route an incoming tunnel message by ``msg["type"]``."""
+        msg_type = msg.get("type", "")
+
+        if msg_type == "request":
+            # Handle in a background thread so the listen loop keeps
+            # calling recv()/ping() during long processing (the transport
+            # drops idle sockets).
+            threading.Thread(
+                target=self._handle_request,
+                args=(msg,),
+                daemon=True,
+            ).start()
+        elif msg_type == "manifest_update":
+            if self._on_manifest_update is not None:
+                try:
+                    self._on_manifest_update()
+                except Exception as e:  # noqa: BLE001 - never kill the loop
+                    print(f"[tunnel] on_manifest_update error: {e}", flush=True)
+        elif msg_type == "ping":
+            try:
+                self._ws.send(json.dumps({"type": "pong"}))
+            except Exception:  # noqa: BLE001
+                pass
 
     def _handle_request(self, msg: dict) -> None:
         request_id = msg.get("request_id", "")

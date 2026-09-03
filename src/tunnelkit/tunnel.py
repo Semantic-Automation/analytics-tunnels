@@ -1,164 +1,142 @@
-"""TunnelManager / TunnelConnection — the accept side of reverse tunnels.
+"""Base Tunnel — shared protocol logic for both sides.
 
-The acceptor (edge proxy today, builder acceptor tomorrow) receives dial-out
-WebSocket connections from peers (spokes/builders), verifies them via an
-injected ``verifier``, holds their sockets, and sends requests through them
-(``send_request``). Transport only — no crypto, no manifest loading; the
-consumer owns identity/role verification and routing state.
-
-Wire format (JSON over WebSocket):
-
-    register:  {spoke_id, kem_pub, x_pub, sign_pub}
-    request:   {type: "request", request_id, path, body(b64), headers}
-    response:  {type: "response", request_id, status, body(b64)}
-    health:    {type: "health", report}
+Both ``Client`` and ``HostTunnel`` inherit from this class. Once connected,
+both ends speak the same language: ``request()`` to send, ``on_request()``
+to handle incoming, ``close()`` to disconnect.
 """
 
 import asyncio
 import base64
 import json
-import threading
-import time
+import uuid
+
+import websockets
 
 
-class TunnelManager:
-    """Tracks peer tunnels.
+class Tunnel:
+    """A bidirectional request/response tunnel over WebSocket.
 
-    ``verifier(tunnel_id, kem_pub, x_pub, sign_pub) -> bool`` decides whether a
-    connecting peer may register. When None, every peer is accepted (dev).
+    Subclasses must set ``self._ws`` before calling ``listen()``.
     """
 
-    def __init__(self, verifier=None):
-        self._verifier = verifier
-        self._tunnels: dict[str, "TunnelConnection"] = {}
-        self._lock = threading.Lock()
+    def __init__(self):
+        self._ws: websockets.WebSocketServerProtocol | websockets.WebSocketClientProtocol | None = None
+        self._handler = None
+        self._pending: dict[str, asyncio.Future] = {}
+        self._running = False
 
-    def register(self, tunnel_id: str, kem_pub: str, x_pub: str, sign_pub: str) -> bool:
-        """Verify + accept a connecting peer. Returns True to register."""
-        if self._verifier is None:
-            return True
-        return bool(self._verifier(tunnel_id, kem_pub, x_pub, sign_pub))
+    def on_request(self, handler) -> None:
+        """Register a handler for incoming requests.
 
-    def connect_tunnel(self, tunnel_id: str, conn: "TunnelConnection") -> None:
-        """Attach an active tunnel, closing any prior connection for the id."""
-        with self._lock:
-            old = self._tunnels.get(tunnel_id)
-            if old:
-                old.close()
-            self._tunnels[tunnel_id] = conn
-        print(f"[tunnel] connected: {tunnel_id}", flush=True)
-
-    def disconnect_tunnel(self, tunnel_id: str) -> None:
-        with self._lock:
-            conn = self._tunnels.pop(tunnel_id, None)
-        if conn:
-            conn.close()
-        print(f"[tunnel] disconnected: {tunnel_id}", flush=True)
-
-    def get_tunnel(self, tunnel_id: str) -> "TunnelConnection | None":
-        with self._lock:
-            return self._tunnels.get(tunnel_id)
-
-    def list_tunnels(self) -> list[dict]:
-        with self._lock:
-            return [
-                {"tunnel_id": tid, "connected_at": c.connected_at, "last_activity": c.last_activity}
-                for tid, c in self._tunnels.items()
-            ]
-
-    def revalidate(self) -> list[str]:
-        """Re-run the verifier against every tunnel's registered sign_pub.
-
-        Disconnects peers the verifier now rejects (revoked/rotated). Returns
-        the list of disconnected ids.
+        ``handler(path, body, headers) -> (status, body)``
         """
-        if self._verifier is None:
-            return []
-        to_disconnect = []
-        with self._lock:
-            for tid, conn in self._tunnels.items():
-                if not self._verifier(tid, "", "", conn.sign_pub):
-                    to_disconnect.append(tid)
-        for tid in to_disconnect:
-            self.disconnect_tunnel(tid)
-            print(f"[tunnel] revoked: {tid}", flush=True)
-        return to_disconnect
+        self._handler = handler
 
+    async def request(self, path: str, body: bytes, headers: dict | None = None, timeout: float = 300.0) -> tuple[int, bytes]:
+        """Send a request and await the response.
 
-class TunnelConnection:
-    """A single peer tunnel.
-
-    Uses ``asyncio.Event`` (not ``threading.Event``) so ``send_request`` can be
-    awaited from the acceptor's event loop without blocking it.
-    """
-
-    def __init__(self, tunnel_id: str, sign_pub: str, write_fn):
-        self.tunnel_id = tunnel_id
-        self.sign_pub = sign_pub
-        self._write = write_fn
-        self.connected_at = time.time()
-        self.last_activity = time.time()
-        self._pending: dict[str, tuple[asyncio.Event, list]] = {}
-        self._lock = asyncio.Lock()
-
-    async def send_request(
-        self, request_id: str, path: str, body: bytes, headers: dict, timeout_s: float = 300.0
-    ) -> tuple[int, bytes]:
-        """Send a request through the tunnel and wait for the response.
-
-        Returns ``(status_code, response_body)``; ``(504, b'')`` on timeout.
+        Returns ``(status, body)``. Times out after ``timeout`` seconds.
         """
-        event = asyncio.Event()
-        slot: list = [None, None]  # [status, body]
-        async with self._lock:
-            self._pending[request_id] = (event, slot)
+        request_id = str(uuid.uuid4())
+        future: asyncio.Future = asyncio.get_event_loop().create_future()
+        self._pending[request_id] = future
 
         msg = json.dumps({
             "type": "request",
             "request_id": request_id,
             "path": path,
             "body": base64.b64encode(body).decode("ascii"),
-            "headers": headers,
-        }).encode("utf-8")
-
-        self.last_activity = time.time()
+            "headers": headers or {},
+        })
         try:
-            await self._write(msg)
-        except Exception as e:  # noqa: BLE001
-            async with self._lock:
-                self._pending.pop(request_id, None)
-            return 500, b'{"error": "tunnel write failed"}'
+            await self._ws.send(msg)
+        except Exception as e:
+            self._pending.pop(request_id, None)
+            raise TunnelError(f"send failed: {e}") from e
 
         try:
-            await asyncio.wait_for(event.wait(), timeout=timeout_s)
+            return await asyncio.wait_for(future, timeout=timeout)
         except asyncio.TimeoutError:
-            async with self._lock:
-                self._pending.pop(request_id, None)
-            return 504, b'{"error": "tunnel timeout"}'
+            self._pending.pop(request_id, None)
+            raise TunnelTimeout(f"request {request_id} timed out after {timeout}s")
 
-        async with self._lock:
-            slot = self._pending.pop(request_id, (None, [None, None]))[1]
+    async def send_response(self, request_id: str, status: int, body: bytes) -> None:
+        """Send a response to a received request."""
+        msg = json.dumps({
+            "type": "response",
+            "request_id": request_id,
+            "status": status,
+            "body": base64.b64encode(body).decode("ascii"),
+        })
+        await self._ws.send(msg)
 
-        status, resp_body = slot
-        if status is None:
-            return 504, b'{"error": "tunnel timeout"}'
+    async def close(self) -> None:
+        """Close the tunnel."""
+        self._running = False
+        self._fail_pending(TunnelClosed("tunnel closed"))
+        if self._ws:
+            await self._ws.close()
 
-        self.last_activity = time.time()
-        return status, resp_body
+    async def listen(self) -> None:
+        """Read messages from the socket and dispatch them."""
+        self._running = True
+        try:
+            async for raw in self._ws:
+                try:
+                    msg = json.loads(raw)
+                except (json.JSONDecodeError, TypeError):
+                    continue
+                await self._dispatch(msg)
+        except websockets.ConnectionClosed:
+            pass
+        finally:
+            self._fail_pending(TunnelClosed("connection lost"))
+            self._pending.clear()
 
-    def deliver_response(self, request_id: str, status: int, body: bytes) -> None:
-        """Deliver a peer's response to the waiting ``send_request``."""
-        entry = self._pending.get(request_id)
-        if entry is None:
-            return
-        event, slot = entry
-        slot[0] = status
-        slot[1] = body
-        event.set()
+    def _fail_pending(self, exc: Exception) -> None:
+        for future in self._pending.values():
+            if not future.done():
+                future.set_exception(exc)
 
-    def close(self) -> None:
-        for event, slot in self._pending.values():
-            slot[0] = 504
-            slot[1] = b'{"error": "tunnel disconnected"}'
-            event.set()
-        self._pending.clear()
+    async def _dispatch(self, msg: dict) -> None:
+        match msg.get("type"):
+            case "request":
+                if self._handler:
+                    asyncio.create_task(self._handle_request(msg))
+            case "response":
+                self._handle_response(msg)
+            case "ping":
+                await self._ws.send(json.dumps({"type": "pong"}))
+            case "close":
+                await self.close()
+
+    async def _handle_request(self, msg: dict) -> None:
+        request_id = msg.get("request_id", "")
+        path = msg.get("path", "/")
+        body = base64.b64decode(msg.get("body", ""))
+        headers = msg.get("headers", {})
+        try:
+            status, response_body = self._handler(path, body, headers)
+        except Exception as e:
+            status, response_body = 500, json.dumps({"error": str(e)}).encode()
+        await self.send_response(request_id, status, response_body)
+
+    def _handle_response(self, msg: dict) -> None:
+        request_id = msg.get("request_id", "")
+        future = self._pending.pop(request_id, None)
+        if future and not future.done():
+            status = msg.get("status", 500)
+            body = base64.b64decode(msg.get("body", ""))
+            future.set_result((status, body))
+
+
+class TunnelError(Exception):
+    pass
+
+
+class TunnelTimeout(TunnelError):
+    pass
+
+
+class TunnelClosed(TunnelError):
+    pass

@@ -88,3 +88,17 @@ def test_on_reconnect_fires_on_reconnect_not_first_connect():
 
     # attempt 1 = boot (no fire); attempts 2,3 = reconnect (fire); attempt 4 stops.
     assert fired == [1, 1]
+
+
+def test_manifest_update_signal_invokes_callback():
+    c = _client()
+    fired = []
+    c._on_manifest_update = lambda: fired.append(1)
+    c._dispatch({"type": "manifest_update"})
+    c._dispatch({"type": "manifest_update"})
+    assert fired == [1, 1]
+
+
+def test_manifest_update_signal_ignored_without_callback():
+    c = _client()  # no on_manifest_update set
+    c._dispatch({"type": "manifest_update"})  # must not raise
