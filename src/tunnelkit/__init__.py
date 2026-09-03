@@ -2,7 +2,7 @@
 
 Both ends of a tunnel share the same API:
 - ``request(path, body, headers)`` — send a request, await the response
-- ``on_request(handler)`` — handle incoming requests
+- ``on_request(handler)`` — handle incoming requests (sync or async)
 - ``close()`` — disconnect
 
 ``TunnelRegistry`` is the role-agnostic node layer: ``get_tunnel``,

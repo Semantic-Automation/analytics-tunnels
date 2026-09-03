@@ -7,6 +7,7 @@ to handle incoming, ``close()`` to disconnect.
 
 import asyncio
 import base64
+import inspect
 import json
 import uuid
 
@@ -28,7 +29,8 @@ class Tunnel:
     def on_request(self, handler) -> None:
         """Register a handler for incoming requests.
 
-        ``handler(path, body, headers) -> (status, body)``
+        ``handler(path, body, headers) -> (status, body)`` — may be sync or
+        ``async``; an awaitable result is awaited.
         """
         self._handler = handler
 
@@ -116,7 +118,10 @@ class Tunnel:
         body = base64.b64decode(msg.get("body", ""))
         headers = msg.get("headers", {})
         try:
-            status, response_body = self._handler(path, body, headers)
+            result = self._handler(path, body, headers)
+            if inspect.isawaitable(result):
+                result = await result
+            status, response_body = result
         except Exception as e:
             status, response_body = 500, json.dumps({"error": str(e)}).encode()
         await self.send_response(request_id, status, response_body)
