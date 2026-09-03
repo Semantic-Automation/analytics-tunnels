@@ -1,4 +1,11 @@
-"""Client — the dial-out side of a tunnel."""
+"""Client — the dial-out side of a tunnel.
+
+A ``Client`` is a :class:`TunnelRegistry` node that dials out to hosts. The
+``Host`` (its counterpart) is the one that exposes a public ``wss://`` address.
+
+Each dialed connection is a :class:`ClientTunnel` that manages its own
+reconnect loop; the ``Client`` node just creates, tracks, and closes them.
+"""
 
 import asyncio
 import json
@@ -6,14 +13,15 @@ import urllib.parse
 
 import websockets
 
+from .registry import TunnelRegistry
 from .tunnel import Tunnel
 
 
-class Client(Tunnel):
-    """Dial-out tunnel client.
+class ClientTunnel(Tunnel):
+    """A single dialed-out tunnel connection.
 
-    Connects to a host, registers with an id + metadata, and listens
-    for incoming requests. Reconnects with exponential backoff.
+    Connects, registers with an id + metadata, and listens. Reconnects with
+    exponential backoff on its own.
     """
 
     def __init__(
@@ -88,6 +96,31 @@ class Client(Tunnel):
             return True
         except asyncio.TimeoutError:
             return False
+
+
+class Client(TunnelRegistry):
+    """A node that dials out to hosts and tracks its connections."""
+
+    def __init__(self, auth=None):
+        super().__init__(auth)
+
+    async def connect(
+        self,
+        url: str,
+        tunnel_id: str,
+        metadata: dict | None = None,
+        on_reconnect=None,
+    ) -> ClientTunnel:
+        """Dial out to a host and register the resulting tunnel.
+
+        Returns the :class:`ClientTunnel` immediately; it connects and
+        reconnects in the background. Displaces any existing tunnel with the
+        same ``tunnel_id``.
+        """
+        tunnel = ClientTunnel(url, tunnel_id, metadata, on_reconnect)
+        await self._register_tunnel(tunnel_id, tunnel)
+        asyncio.create_task(tunnel.connect())
+        return tunnel
 
 
 class RegistrationRejected(Exception):

@@ -15,6 +15,7 @@ async def test_host_to_client_request():
     """Host sends a request to the client and gets a response."""
     auth = StaticAuth(allowed={"spoke-1": {"sign_pub": "abc"}})
     host = Host(auth)
+    client = Client(auth)
 
     async def handler(websocket):
         tunnel = await host.accept(websocket)
@@ -24,17 +25,15 @@ async def test_host_to_client_request():
 
     async with websockets.serve(handler, "localhost", 0) as server:
         port = server.sockets[0].getsockname()[1]
-        client = Client(f"ws://localhost:{port}", "spoke-1", metadata={"sign_pub": "abc"})
-        client.on_request(lambda path, body, headers: (200, b"response from client"))
+        conn = await client.connect(f"ws://localhost:{port}", "spoke-1", metadata={"sign_pub": "abc"})
+        conn.on_request(lambda path, body, headers: (200, b"response from client"))
 
-        task = asyncio.create_task(client.connect())
         # Wait until the client is actually registered and listening before
         # the host handler sends its request (avoids a race on the 300s default
         # request timeout).
-        assert await client.wait_connected(timeout=2.0)
+        assert await conn.wait_connected(timeout=2.0)
         await asyncio.sleep(0.2)  # let the host's request round-trip complete
         await client.close()
-        await task
 
 
 @pytest.mark.asyncio
@@ -42,6 +41,7 @@ async def test_client_to_host_request():
     """Client sends a request to the host and gets a response."""
     auth = StaticAuth(allowed={"spoke-1": {"sign_pub": "abc"}})
     host = Host(auth)
+    client = Client(auth)
 
     async def handler(websocket):
         tunnel = await host.accept(websocket)
@@ -50,17 +50,16 @@ async def test_client_to_host_request():
 
     async with websockets.serve(handler, "localhost", 0) as server:
         port = server.sockets[0].getsockname()[1]
-        client = Client(f"ws://localhost:{port}", "spoke-1", metadata={"sign_pub": "abc"})
+        conn = await client.connect(f"ws://localhost:{port}", "spoke-1", metadata={"sign_pub": "abc"})
 
-        task = asyncio.create_task(client.connect())
-        await asyncio.sleep(0.2)
+        assert await conn.wait_connected(timeout=2.0)
+        await asyncio.sleep(0.1)
 
-        status, body = await client.request("/data", b"request-body")
+        status, body = await conn.request("/data", b"request-body")
         assert status == 200
         assert body == b"response from host"
 
         await client.close()
-        await task
 
 
 @pytest.mark.asyncio
@@ -68,6 +67,8 @@ async def test_bidirectional_requests():
     """Both sides send requests to each other."""
     auth = StaticAuth(allowed={"spoke-1": {"sign_pub": "abc"}})
     host = Host(auth)
+    client = Client(auth)
+    done = asyncio.Event()
 
     async def handler(websocket):
         tunnel = await host.accept(websocket)
@@ -77,19 +78,20 @@ async def test_bidirectional_requests():
         assert status == 200
         assert body == b"client-echo:hello"
 
-        await asyncio.sleep(0.2)
+        # keep the connection alive until the test finishes its own request
+        await done.wait()
 
     async with websockets.serve(handler, "localhost", 0) as server:
         port = server.sockets[0].getsockname()[1]
-        client = Client(f"ws://localhost:{port}", "spoke-1", metadata={"sign_pub": "abc"})
-        client.on_request(lambda path, body, headers: (200, b"client-echo:" + body))
+        conn = await client.connect(f"ws://localhost:{port}", "spoke-1", metadata={"sign_pub": "abc"})
+        conn.on_request(lambda path, body, headers: (200, b"client-echo:" + body))
 
-        task = asyncio.create_task(client.connect())
+        assert await conn.wait_connected(timeout=2.0)
         await asyncio.sleep(0.2)
 
-        status, body = await client.request("/ping", b"world", {})
+        status, body = await conn.request("/ping", b"world", {})
         assert status == 200
         assert body == b"host-echo:world"
 
+        done.set()
         await client.close()
-        await task

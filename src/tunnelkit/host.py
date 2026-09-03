@@ -1,4 +1,9 @@
-"""Host — the accept side of a tunnel."""
+"""Host — the accept side of a tunnel.
+
+The ``Host`` is a :class:`TunnelRegistry` node that accepts inbound dial-out
+connections and serves them. It holds a public ``wss://`` address; the
+``Client`` (its counterpart) is the one that dials out.
+"""
 
 import asyncio
 import json
@@ -6,6 +11,7 @@ import json
 import websockets
 
 from .auth import Auth, NoAuth
+from .registry import TunnelRegistry
 from .tunnel import Tunnel
 
 
@@ -57,21 +63,17 @@ class HostTunnel(Tunnel):
         return self.tunnel_id is not None
 
 
-class Host:
-    """Manages accepted tunnel connections."""
+class Host(TunnelRegistry):
+    """Accepts and manages inbound tunnel connections."""
 
     def __init__(self, auth: Auth | None = None):
-        self._auth = auth or NoAuth()
-        self._tunnels: dict[str, HostTunnel] = {}
-
-    @property
-    def auth(self) -> Auth:
-        return self._auth
+        super().__init__(auth)
 
     async def accept(self, ws) -> HostTunnel | None:
         """Accept a new WebSocket connection.
 
-        Returns the tunnel if registration succeeds, None if rejected.
+        Verifies the peer via auth and registers it under its ``tunnel_id``.
+        Returns the tunnel if registration succeeds, ``None`` if rejected.
         """
         tunnel = HostTunnel(ws, self._auth)
         task = asyncio.create_task(tunnel.listen())
@@ -80,24 +82,5 @@ class Host:
         if not success:
             return None
 
-        self._tunnels[tunnel.tunnel_id] = tunnel
+        await self._register_tunnel(tunnel.tunnel_id, tunnel)
         return tunnel
-
-    def get_tunnel(self, tunnel_id: str) -> HostTunnel | None:
-        return self._tunnels.get(tunnel_id)
-
-    async def disconnect_tunnel(self, tunnel_id: str) -> None:
-        tunnel = self._tunnels.pop(tunnel_id, None)
-        if tunnel:
-            await tunnel.close()
-
-    def list_tunnels(self) -> list[dict]:
-        return [
-            {"tunnel_id": tid}
-            for tid in self._tunnels
-        ]
-
-    async def close(self) -> None:
-        for tunnel in list(self._tunnels.values()):
-            await tunnel.close()
-        self._tunnels.clear()

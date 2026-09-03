@@ -20,9 +20,28 @@ Requires Python >= 3.11 and [`websockets`](https://websockets.readthedocs.io/) >
 
 Everything lives in the `tunnelkit` package.
 
-### Shared — both ends
+### Two layers
 
-Both `Client` and `HostTunnel` extend the base `Tunnel` class, so both support:
+Every node is a **`TunnelRegistry`** — a role-agnostic registry of its live
+connections, keyed by `tunnel_id`. `Client` (dial-out) and `Host` (accept) are
+both registries; they differ *only* in how connections get established.
+
+```python
+class TunnelRegistry:                  # shared node layer
+    def get_tunnel(self, tunnel_id) -> Tunnel | None
+    async def disconnect_tunnel(self, tunnel_id) -> None
+    def list_tunnels(self) -> list[dict]
+    async def close(self) -> None
+```
+
+Because the registry is shared, `get_tunnel`, `disconnect_tunnel`,
+`list_tunnels` and `close` behave identically whether you're calling a client
+or a host — callers don't need to know which role a tunnel belongs to.
+
+### Tunnel — a single connection (either end)
+
+Each connection is a `Tunnel`, whether a `ClientTunnel` (dialed) or a
+`HostTunnel` (accepted). Both support the same symmetric methods:
 
 | Method | Signature | Purpose |
 |--------|-----------|---------|
@@ -36,17 +55,23 @@ Both `Client` and `HostTunnel` extend the base `Tunnel` class, so both support:
 ```python
 from tunnelkit import Client
 
-client = Client(url="wss://edge.example.com", tunnel_id="spoke-1", metadata={"sign_pub": "..."})
-client.on_request(lambda path, body, headers: (200, b"ok"))
+client = Client(auth)                       # a node that dials out
+conn = await client.connect(
+    url="wss://edge.example.com",
+    tunnel_id="spoke-1",
+    metadata={"sign_pub": "..."},
+)                                           # returns a ClientTunnel
+conn.on_request(lambda path, body, headers: (200, b"ok"))
 
-await client.connect()      # connect, register, listen; reconnects on drop
-await client.wait_connected(timeout=5.0)   # optional: wait until registered
+await conn.wait_connected(timeout=5.0)      # optional: wait until registered
 ```
 
 - Dials `wss://<host>/tunnel/connect`, registers with `tunnel_id` + `metadata`.
-- Reconnects with exponential backoff (1s → 60s). `on_reconnect` (a zero-arg
-  async callback) runs before each reconnect.
-- `close()` stops the reconnect loop.
+- Each `ClientTunnel` reconnects independently with exponential backoff
+  (1s → 60s). `on_reconnect` (a zero-arg async callback) runs before each
+  reconnect.
+- One `Client` node can manage many connections (e.g. one per host).
+- `client.close()` stops all of them.
 
 ### Host — accept side
 
@@ -54,7 +79,7 @@ await client.wait_connected(timeout=5.0)   # optional: wait until registered
 from tunnelkit import Host, StaticAuth
 
 auth = StaticAuth(allowed={"spoke-1": {"sign_pub": "..."}})
-host = Host(auth)
+host = Host(auth)                       # a node that accepts inbound connections
 ```
 
 `Host` manages accepted connections. Wire it into your WebSocket server:
@@ -72,10 +97,14 @@ async def ws_handler(websocket):
 | Method | Purpose |
 |--------|---------|
 | `accept(ws)` | Accept a connection; returns a `HostTunnel` or `None` if rejected. |
-| `get_tunnel(tunnel_id)` | Look up a registered tunnel. |
-| `disconnect_tunnel(tunnel_id)` | Close a specific tunnel. |
-| `list_tunnels()` | List registered tunnel ids. |
-| `close()` | Close all tunnels. |
+
+Since `Host` is a `TunnelRegistry`, it also supports `get_tunnel`,
+`disconnect_tunnel`, `list_tunnels` and `close` — identical to `Client`.
+
+### Duplicate `tunnel_id`
+
+Registering/dialing a `tunnel_id` that already exists **closes the displaced
+connection** — on both client and host — so no tunnel is ever orphaned.
 
 ## Authentication
 
@@ -121,8 +150,9 @@ status, body = await tunnel.request("/ping", b"hello")
 
 ```python
 # client side
-client.on_request(lambda path, body, headers: (200, b"client-echo:" + body))
-status, body = await client.request("/ping", b"world")
+conn = await client.connect(url="wss://edge.example.com", tunnel_id="spoke-1", metadata={...})
+conn.on_request(lambda path, body, headers: (200, b"client-echo:" + body))
+status, body = await conn.request("/ping", b"world")
 ```
 
 ## Testing
@@ -132,7 +162,7 @@ python -m venv .testvenv && .testvenv/bin/pip install -e . pytest pytest-asyncio
 .testvenv/bin/pytest tests/ -q
 ```
 
-Result: `18 passed, 1 skipped`.
+Result: `23 passed, 1 skipped`.
 
 ### Known test issue
 
@@ -145,10 +175,11 @@ covered by the real-WebSocket integration tests in `tests/test_integration.py`.
 
 ```
 src/tunnelkit/
-  __init__.py   # exports: Tunnel, Client, Host, HostTunnel, Auth, NoAuth, StaticAuth, ...
+  __init__.py   # exports: Tunnel, TunnelRegistry, Client, ClientTunnel, Host, HostTunnel, ...
   tunnel.py     # Tunnel base class: shared request/response/close/listen
-  client.py     # Client: dial-out + reconnect
-  host.py       # Host (manager) + HostTunnel (single accepted connection)
+  registry.py   # TunnelRegistry node layer: get/disconnect/list/close (role-agnostic)
+  client.py     # ClientTunnel (dial-out + reconnect) + Client (node that dials)
+  host.py       # HostTunnel (accepted connection) + Host (node that accepts)
   auth.py       # Auth protocol, NoAuth, StaticAuth
 ```
 
