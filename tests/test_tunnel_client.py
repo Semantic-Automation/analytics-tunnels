@@ -67,3 +67,24 @@ def test_registration_message_shape():
     c = _client()
     reg = {"spoke_id": "peer-1", **c._public_keys}
     assert reg == {"spoke_id": "peer-1", "sign_pub": "abc"}
+
+
+def test_on_reconnect_fires_on_reconnect_not_first_connect():
+    c = TunnelClient("https://x", "peer-1")
+    c._reconnect_delay = 0.0
+    c._max_reconnect_delay = 1.0
+    fired = []
+    c._on_reconnect = lambda: fired.append(1)
+    seen = {"n": 0}
+
+    def fake_connect_and_listen():
+        seen["n"] += 1
+        if seen["n"] >= 4:
+            c._running = False  # stop after 4 attempts
+        raise RuntimeError("drop")
+
+    c._connect_and_listen = fake_connect_and_listen
+    c.connect()
+
+    # attempt 1 = boot (no fire); attempts 2,3 = reconnect (fire); attempt 4 stops.
+    assert fired == [1, 1]

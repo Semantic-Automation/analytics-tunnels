@@ -31,6 +31,11 @@ class TunnelClient:
     for each request. ``health_fn`` is called periodically to produce a health
     report pushed to the acceptor. ``public_keys`` is a dict with
     ``kem_pub``/``x_pub``/``sign_pub`` (base64) sent at registration.
+
+    ``on_reconnect`` is an optional zero-arg callback invoked on every
+    *reconnect* (never the initial connection), right before the backoff
+    sleep.  It lets a caller re-fetch configuration (e.g. a signed manifest)
+    whenever the tunnel comes back up after a drop.
     """
 
     def __init__(
@@ -40,12 +45,15 @@ class TunnelClient:
         public_keys: dict | None = None,
         handler=None,
         health_fn=None,
+        on_reconnect=None,
     ):
         self._proxy_url = proxy_url.rstrip("/")
         self._tunnel_id = tunnel_id
         self._public_keys = public_keys or {}
         self._handler = handler
         self._health_fn = health_fn
+        self._on_reconnect = on_reconnect
+        self._connected_once = False
         self._ws = None
         self._running = False
         self._reconnect_delay = 1.0
@@ -61,9 +69,13 @@ class TunnelClient:
                 print(f"[tunnel] connection error: {e}", flush=True)
 
             if self._running:
+                if self._connected_once and self._on_reconnect:
+                    self._on_reconnect()
                 print(f"[tunnel] reconnecting in {self._reconnect_delay:.1f}s...", flush=True)
                 time.sleep(self._reconnect_delay)
                 self._reconnect_delay = min(self._reconnect_delay * 2, self._max_reconnect_delay)
+
+            self._connected_once = True
 
     def _connect_and_listen(self) -> None:
         ws_url = self._proxy_url.replace("https://", "wss://").replace("http://", "ws://")
