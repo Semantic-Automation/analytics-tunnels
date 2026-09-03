@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "analytics-tunnels"
-version = "0.1.0"
+version = "0.1.1"
 description = "Transport-only WebSocket reverse-tunnel client/server (dial-out, register, keepalive, dispatch). No crypto: handlers are injected by consumers."
 requires-python = ">=3.11"
 dependencies = ["websocket-client>=1.6.0"]
