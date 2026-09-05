@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "analytics-tunnels"
-version = "0.2.2"
+version = "0.3.0"
 description = "Symmetric WebSocket tunnels. Both ends share the same request/response API. No crypto: auth is injected by consumers."
 requires-python = ">=3.11"
 dependencies = ["websockets>=12.0"]

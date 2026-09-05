@@ -38,7 +38,10 @@ class TunnelRegistry:
             await tunnel.close()
 
     def list_tunnels(self) -> list[dict]:
-        return [{"tunnel_id": tid} for tid in self._tunnels]
+        return [
+            {"tunnel_id": tid, "state": tunnel.state}
+            for tid, tunnel in self._tunnels.items()
+        ]
 
     async def close(self) -> None:
         async with self._lock:
@@ -65,3 +68,22 @@ class TunnelRegistry:
                 flush=True,
             )
             await old.close()
+
+    def _eviction_handler_for(self, tunnel: Tunnel):
+        """Return an async hook that evicts ``tunnel`` when its connection dies.
+
+        The pop is identity-guarded so a newer tunnel that took over the same
+        ``tunnel_id`` is never removed. Nodes whose tunnels legitimately
+        survive connection loss (the dial-out ``Client`` and its reconnect
+        loop) don't wire this and keep their entry instead.
+        """
+
+        async def evict() -> None:
+            tunnel_id = getattr(tunnel, "tunnel_id", None)
+            if tunnel_id is None:
+                return
+            async with self._lock:
+                if self._tunnels.get(tunnel_id) is tunnel:
+                    self._tunnels.pop(tunnel_id, None)
+
+        return evict

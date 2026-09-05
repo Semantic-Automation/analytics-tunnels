@@ -48,7 +48,14 @@ Each connection is a `Tunnel`, whether a `ClientTunnel` (dialed) or a
 | `request` | `await tunnel.request(path, body, headers=None, timeout=300.0) -> (int, bytes)` | Send a request, await the response. Raises `TunnelTimeout` on timeout. |
 | `on_request` | `tunnel.on_request(handler)` | Register `handler(path, body, headers) -> (int, bytes)` for incoming requests. |
 | `send_response` | `await tunnel.send_response(request_id, status, body)` | Manually reply to a received request. |
+| `state` | `tunnel.state` | Health: `idle`/`connecting`/`connected`/`reconnecting`/`closed`. |
+| `healthy` | `tunnel.healthy` | `True` while the tunnel reports `connected`. |
+| `on_disconnect` | `tunnel.on_disconnect(handler)` | Register `handler()` invoked once when the connection is lost. |
+| `wait_disconnected` | `await tunnel.wait_disconnected(timeout=None) -> bool` | Wait until the current connection ends. |
 | `close` | `await tunnel.close()` | Close the connection. Either end can call it. |
+
+`request()` **fails fast**: it raises `TunnelClosed` immediately when the
+tunnel isn't connected, instead of parking a 300s request on a dead socket.
 
 ### Client — dial-out side
 
@@ -106,6 +113,39 @@ Since `Host` is a `TunnelRegistry`, it also supports `get_tunnel`,
 Registering/dialing a `tunnel_id` that already exists **closes the displaced
 connection** — on both client and host — so no tunnel is ever orphaned.
 
+## Connection health
+
+Both sides detect when the underlying connection dies, funneling **every**
+cause into one teardown path:
+
+* **Clean / crash drop** — the peer closed, its process died, or the TCP
+  connection was reset. The `websockets` library surfaces this to the receive
+  loop immediately, so it is detected instantly.
+* **Silent drop** — a network partition, power loss or NAT timeout where no TCP
+  segment ever arrives. Nothing can detect this faster than probing the peer:
+  each side sends an application-level `ping` every `heartbeat_interval`
+  seconds and declares the connection lost if no frame (including the peer's
+  `pong`) arrives within `heartbeat_timeout`.
+
+When either fires, pending requests fail with `TunnelClosed`, the socket is
+closed, `on_disconnect` handlers run, and the owning registry **evicts the
+dead tunnel** — a `HostTunnel` never lingers as a phantom after its peer
+vanishes. A dial-out `ClientTunnel` instead keeps its registry entry (it
+reconnects on its own) but reports `state == "reconnecting"` until it is
+re-established.
+
+Defaults are `heartbeat_interval=10s`, `heartbeat_timeout=30s` (so a silent
+drop is noticed within ~30–40s). Pass `heartbeat_interval=0` /
+`heartbeat_timeout=0` to disable. Both are configurable per connection:
+
+```python
+conn = await client.connect(url, "spoke-1", metadata={...},
+                            heartbeat_interval=5.0, heartbeat_timeout=15.0)
+# ...or on the accept side:
+tunnel = await host.accept(websocket,
+                           heartbeat_interval=5.0, heartbeat_timeout=15.0)
+```
+
 ## Authentication
 
 `Auth` is a protocol with a single method:
@@ -135,8 +175,13 @@ response:        {type: "response", request_id, status, body(b64)}
 ping:            {type: "ping"}  ->  {type: "pong"}
 ```
 
-There are no special-purpose message types (no manifest pushes, no health
-reports). Any application-level signal travels over `request`/`response`.
+The `ping`/`pong` message pair doubles as the heartbeat: both sides send
+`ping` periodically and treat silence as a lost connection (see Connection
+health above). There are no special-purpose message types (no manifest
+pushes, no health reports) beyond this.
+
+`list_tunnels()` entries now carry each tunnel's health:
+`{"tunnel_id": "...", "state": "connected"}`.
 
 ## Examples
 
@@ -162,7 +207,7 @@ python -m venv .testvenv && .testvenv/bin/pip install -e . pytest pytest-asyncio
 .testvenv/bin/pytest tests/ -q
 ```
 
-Result: `23 passed, 1 skipped`.
+Result: `29 passed, 1 skipped`.
 
 ### Known test issue
 

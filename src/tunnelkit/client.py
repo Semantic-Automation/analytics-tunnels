@@ -5,6 +5,12 @@ A ``Client`` is a :class:`TunnelRegistry` node that dials out to hosts. The
 
 Each dialed connection is a :class:`ClientTunnel` that manages its own
 reconnect loop; the ``Client`` node just creates, tracks, and closes them.
+
+Unlike a host-side tunnel, a ``ClientTunnel`` is **not** evicted from its
+registry when the connection drops — it represents a persistent dial-out
+intent and reconnects on its own. While it is down it reports
+``state == "reconnecting"`` and ``request()`` fails fast until the connection
+is re-established.
 """
 
 import asyncio
@@ -14,14 +20,21 @@ import urllib.parse
 import websockets
 
 from .registry import TunnelRegistry
-from .tunnel import Tunnel
+from .tunnel import (
+    DEFAULT_HEARTBEAT_INTERVAL,
+    DEFAULT_HEARTBEAT_TIMEOUT,
+    Tunnel,
+    _STATE_CONNECTING,
+    _STATE_RECONNECTING,
+)
 
 
 class ClientTunnel(Tunnel):
     """A single dialed-out tunnel connection.
 
     Connects, registers with an id + metadata, and listens. Reconnects with
-    exponential backoff on its own.
+    exponential backoff on its own whenever the connection is lost — including
+    silent drops detected by the heartbeat (see ``Tunnel``).
     """
 
     def __init__(
@@ -30,8 +43,14 @@ class ClientTunnel(Tunnel):
         tunnel_id: str,
         metadata: dict | None = None,
         on_reconnect=None,
+        *,
+        heartbeat_interval: float | None = DEFAULT_HEARTBEAT_INTERVAL,
+        heartbeat_timeout: float | None = DEFAULT_HEARTBEAT_TIMEOUT,
     ):
-        super().__init__()
+        super().__init__(
+            heartbeat_interval=heartbeat_interval,
+            heartbeat_timeout=heartbeat_timeout,
+        )
         self._url = url.rstrip("/")
         self._tunnel_id = tunnel_id
         self._metadata = metadata or {}
@@ -39,13 +58,13 @@ class ClientTunnel(Tunnel):
         self._reconnect_delay = 1.0
         self._max_reconnect_delay = 60.0
         self._connected_once = False
-        self._connected = asyncio.Event()
 
     async def connect(self) -> None:
         """Connect, register, and listen. Reconnects on failure."""
         self._running = True
         while self._running:
             self._connected.clear()
+            self._set_state(_STATE_CONNECTING)
             try:
                 await self._connect_and_listen()
             except Exception:
@@ -54,6 +73,7 @@ class ClientTunnel(Tunnel):
             if not self._running:
                 break
 
+            self._set_state(_STATE_RECONNECTING)
             if self._connected_once and self._on_reconnect:
                 await self._on_reconnect()
 
@@ -110,6 +130,9 @@ class Client(TunnelRegistry):
         tunnel_id: str,
         metadata: dict | None = None,
         on_reconnect=None,
+        *,
+        heartbeat_interval: float | None = None,
+        heartbeat_timeout: float | None = None,
     ) -> ClientTunnel:
         """Dial out to a host and register the resulting tunnel.
 
@@ -117,7 +140,14 @@ class Client(TunnelRegistry):
         reconnects in the background. Displaces any existing tunnel with the
         same ``tunnel_id``.
         """
-        tunnel = ClientTunnel(url, tunnel_id, metadata, on_reconnect)
+        kwargs: dict = {}
+        if heartbeat_interval is not None:
+            kwargs["heartbeat_interval"] = heartbeat_interval
+        if heartbeat_timeout is not None:
+            kwargs["heartbeat_timeout"] = heartbeat_timeout
+        tunnel = ClientTunnel(
+            url, tunnel_id, metadata, on_reconnect, **kwargs
+        )
         await self._register_tunnel(tunnel_id, tunnel)
         asyncio.create_task(tunnel.connect())
         return tunnel

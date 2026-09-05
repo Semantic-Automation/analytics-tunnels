@@ -4,6 +4,7 @@ import asyncio
 import json
 
 import pytest
+import websockets.exceptions
 
 from tunnelkit.tunnel import Tunnel, TunnelClosed, TunnelTimeout
 
@@ -20,21 +21,21 @@ class _MockWS:
         self.sent.append(data)
 
     async def recv(self) -> str:
-        return await self._queue.get()
+        # Block until a frame arrives or the socket is closed (a closed mock
+        # surfaces closure to a pending recv, like a real WebSocket would).
+        while True:
+            if self._closed and self._queue.empty():
+                raise websockets.exceptions.ConnectionClosed(None, None)
+            try:
+                return await asyncio.wait_for(self._queue.get(), timeout=0.05)
+            except asyncio.TimeoutError:
+                continue
 
     async def put(self, data: str) -> None:
         await self._queue.put(data)
 
     async def close(self) -> None:
         self._closed = True
-
-    async def __aiter__(self):
-        while not self._closed:
-            try:
-                data = await asyncio.wait_for(self._queue.get(), timeout=0.1)
-                yield data
-            except asyncio.TimeoutError:
-                continue
 
 
 @pytest.fixture
@@ -180,3 +181,78 @@ async def test_ping_pong(paired_ws):
 
     await tunnel_b.close()
     await listen_task
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_detects_silent_peer():
+    """A peer that stops sending entirely is declared lost after the window."""
+    a = _MockWS()
+    lost = asyncio.Event()
+    tunnel = Tunnel(heartbeat_interval=60.0, heartbeat_timeout=0.05)
+    tunnel._ws = a
+    tunnel.on_disconnect(lambda: lost.set())
+
+    task = asyncio.create_task(tunnel.listen())
+
+    # Nothing is ever delivered to the socket: the bounded recv window elapses.
+    assert await asyncio.wait_for(tunnel.wait_disconnected(), timeout=2.0)
+    assert tunnel.state == "closed"
+    assert tunnel.healthy is False
+    assert lost.is_set()
+    await task
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_loss_fails_pending_requests():
+    """A request pending at the moment of a silent drop fails fast."""
+    a = _MockWS()
+    tunnel = Tunnel(heartbeat_interval=60.0, heartbeat_timeout=0.3)
+    tunnel._ws = a
+
+    task = asyncio.create_task(tunnel.listen())
+    request_task = asyncio.create_task(tunnel.request("/slow", b"data", timeout=300))
+    await asyncio.sleep(0.05)  # let the request become pending
+
+    assert await asyncio.wait_for(tunnel.wait_disconnected(), timeout=2.0)
+    with pytest.raises(TunnelClosed):
+        await request_task
+    await task
+
+
+@pytest.mark.asyncio
+async def test_request_fails_fast_when_not_connected():
+    """request() on a dead tunnel raises immediately, not after a timeout."""
+    a = _MockWS()
+    tunnel = Tunnel(heartbeat_interval=60.0, heartbeat_timeout=0.05)
+    tunnel._ws = a
+
+    task = asyncio.create_task(tunnel.listen())
+    assert await asyncio.wait_for(tunnel.wait_disconnected(), timeout=2.0)
+    await task
+
+    with pytest.raises(TunnelClosed):
+        await tunnel.request("/x", b"y", timeout=10.0)
+
+
+@pytest.mark.asyncio
+async def test_heartbeat_pings_keep_idle_tunnel_alive(paired_ws):
+    """Periodic pings/pongs keep a healthy-but-idle tunnel from false-dropping."""
+    a, b = paired_ws
+
+    tunnel_a = Tunnel(heartbeat_interval=0.02, heartbeat_timeout=0.1)
+    tunnel_a._ws = a
+    tunnel_b = Tunnel()
+    tunnel_b._ws = b
+
+    listen_a = asyncio.create_task(tunnel_a.listen())
+    listen_b = asyncio.create_task(tunnel_b.listen())  # peer that pongs
+
+    await asyncio.sleep(0.4)  # several heartbeat windows
+
+    assert tunnel_a.healthy          # kept alive by the peer's pongs
+    assert tunnel_a.state == "connected"
+
+    await tunnel_b.close()
+    await tunnel_a.close()
+    await listen_b
+    await listen_a

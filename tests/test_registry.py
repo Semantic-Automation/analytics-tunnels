@@ -34,22 +34,12 @@ async def test_client_registry_orphan_close_on_duplicate_id():
     auth = StaticAuth(allowed={"spoke-1": {"sign_pub": "abc"}})
     host = Host(auth)
     client = Client(auth)
-    closed_ids = []
 
     async def handler(websocket):
         tunnel = await host.accept(websocket)
         if tunnel is None:
             return
-        closed = asyncio.Event()
-        original_close = tunnel.close
-
-        async def spy_close():
-            closed_ids.append(tunnel.tunnel_id)
-            closed.set()
-            await original_close()
-
-        tunnel.close = spy_close
-        await closed.wait()
+        await tunnel.wait_disconnected()
 
     async with websockets.serve(handler, "localhost", 0) as server:
         port = server.sockets[0].getsockname()[1]
@@ -58,17 +48,21 @@ async def test_client_registry_orphan_close_on_duplicate_id():
         async def dial_once():
             conn = await client.connect(url, "spoke-1", metadata={"sign_pub": "abc"})
             assert await conn.wait_connected(timeout=2.0)
-            await asyncio.sleep(0.1)
+            return conn
 
         # First dial registers; second dial (same id) displaces the first.
-        await dial_once()
-        await dial_once()
+        first = await dial_once()
+        await asyncio.sleep(0.1)
+        second = await dial_once()
 
+        # The first connection is closed by the displacement...
+        assert await first.wait_disconnected(timeout=2.0)
+        # ...and only the new connection remains, on both sides.
         assert len(client.list_tunnels()) == 1
-        assert closed_ids == ["spoke-1"]
+        assert client.get_tunnel("spoke-1") is second
+        assert len(host.list_tunnels()) == 1
+        assert host.get_tunnel("spoke-1").tunnel_id == "spoke-1"
 
-        # Close the host side too so the still-registered connection's
-        # handler is released; otherwise it blocks forever on closed.wait().
         await host.close()
         await client.close()
 
@@ -90,7 +84,7 @@ async def test_registry_get_disconnect_list_close():
         assert await conn.wait_connected(timeout=2.0)
 
         assert client.get_tunnel("spoke-1") is conn
-        assert client.list_tunnels() == [{"tunnel_id": "spoke-1"}]
+        assert client.list_tunnels() == [{"tunnel_id": "spoke-1", "state": "connected"}]
 
         await client.disconnect_tunnel("spoke-1")
         assert client.get_tunnel("spoke-1") is None
